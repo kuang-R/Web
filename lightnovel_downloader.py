@@ -1,31 +1,61 @@
 #!/usr/bin/env python3
 """
-轻小说下载器 - LightNovelShelf Downloader
-基于 SignalR + MessagePack 协议从 api.lightnovel.life 下载轻小说
+轻小说下载器 — LightNovelShelf Downloader
+===========================================
+基于 SignalR JSON Hub 协议从 lightnovel.life 下载轻小说。支持搜索、
+查看信息、下载全书，自动处理网站的自定义字体加密。
 
-用法:
-    # 先安装依赖
+依赖
+----
     pip install httpx websockets msgpack
 
-    # 搜索（无需登录）
-    python lightnovel_downloader.py search "关键词"
+用法
+----
+    # 搜索书籍
+    python lightnovel_downloader.py --token TOKEN search "关键词"
+    python lightnovel_downloader.py --token TOKEN search "关键词" -p 2    # 翻页
 
-    # 下载小说（交互式输入 token）
-    python lightnovel_downloader.py download 16834
+    # 查看书籍信息
+    python lightnovel_downloader.py --token TOKEN info 16834
 
-    # 直接传入 token（不交互）
-    python lightnovel_downloader.py --token YOUR_TOKEN download 16834
+    # 下载全书
+    python lightnovel_downloader.py --token TOKEN download 16834           # 默认 HTML
+    python lightnovel_downloader.py --token TOKEN download 16834 -f text   # 纯文本
+    python lightnovel_downloader.py --token TOKEN download 16834 -o ./out  # 指定输出目录
+    python lightnovel_downloader.py --token TOKEN download 16834 -c 10     # 10 并发
+    python lightnovel_downloader.py --token TOKEN download 16834 --cover   # 同时下载封面
 
-如何获取 Token:
-    登录 https://www.lightnovel.app，打开浏览器控制台(F12)→ 应用程序(Application) →
-    IndexedDB → LightNovelShelf → UserAuthentication → RefreshToken，复制它的值。
-    或者直接在控制台执行:
+    不传 --token 时会交互式提示输入。
+
+输出格式
+--------
+    html     默认格式。自动下载加密字体并嵌入 CSS，浏览器打开即可阅读。
+    text     纯文本（加密字体无法解码，输出乱码）。
+    markdown Markdown 格式（同上限制）。
+
+获取 Token
+----------
+    登录 https://www.lightnovel.app → F12 控制台 → Application →
+    IndexedDB → LightNovelShelf → UserAuthentication → RefreshToken，复制值。
+
+    或在控制台执行:
         const req = indexedDB.open('LightNovelShelf');
         req.onsuccess = () => {
             const tx = req.result.transaction('UserAuthentication');
             tx.objectStore('UserAuthentication').get('RefreshToken')
               .onsuccess = (e) => console.log(e.target.result);
         };
+
+技术说明
+--------
+    1. 服务端 API 是 ASP.NET Core SignalR Hub（/hub/api），使用 JSON Hub 协议。
+    2. 所有请求需要登录认证：RefreshToken 换取 session token → negotiate →
+       WebSocket 连接（?access_token=...）。
+    3. Hub 方法签名均为 (params, {UseGzip: true})，响应中 Response 字段为
+       base64 + gzip 编码的 JSON。
+    4. 正文使用自定义 WOFF2 字体加密：将 CJK 字符映射到 Unicode PUA 私用区
+       （U+E000~U+F8FF），只有加载对应字体才能正确渲染。本脚本自动下载字体
+       并嵌入 HTML，无需额外处理。
 """
 
 import argparse
@@ -808,15 +838,11 @@ def main():
         description="轻小说下载器 - LightNovelShelf Downloader",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-使用示例:
-  %(prog)s search "转生"                    搜索（无需登录）
-  %(prog)s download 16834                   下载（交互式输入token）
-  %(prog)s --token YOUR_TOKEN info 16834    查看信息
-  %(prog)s --token YOUR_TOKEN download 16834 -f text
-
-获取 Token:
-  登录 https://www.lightnovel.app → 控制台(F12) → Application →
-  IndexedDB → LightNovelShelf → UserAuthentication → RefreshToken
+示例:
+  %(prog)s --token TOKEN search "转生"
+  %(prog)s --token TOKEN info 16834
+  %(prog)s --token TOKEN download 16834
+  %(prog)s --token TOKEN download 16834 -f html -c 10 --cover
         """,
     )
 
