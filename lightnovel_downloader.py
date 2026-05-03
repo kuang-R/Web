@@ -401,10 +401,15 @@ class LightNovelAPI:
 
     def _parse_book_info(self, raw: Any) -> BookInfo:
         book = raw.get("Book", raw) if isinstance(raw, dict) else raw
+        author = book.get("Author") or book.get("Arthur") or ""
+        if not author:
+            user = book.get("User", {})
+            if isinstance(user, dict):
+                author = user.get("UserName", "")
         info = BookInfo(
             id=book.get("Id", 0),
             title=book.get("Title", ""),
-            author=book.get("Author", ""),
+            author=author,
             introduction=book.get("Introduction", ""),
             cover=book.get("Cover", ""),
             views=book.get("Views", 0),
