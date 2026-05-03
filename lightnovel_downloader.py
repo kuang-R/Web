@@ -24,12 +24,14 @@
     python lightnovel_downloader.py --token TOKEN download 16834 -o ./out  # 指定输出目录
     python lightnovel_downloader.py --token TOKEN download 16834 -c 10     # 10 并发
     python lightnovel_downloader.py --token TOKEN download 16834 --cover   # 同时下载封面
+    python lightnovel_downloader.py --token TOKEN download 16834 -f epub   # EPUB 电子书
 
     不传 --token 时会交互式提示输入。
 
 输出格式
 --------
-    html     默认格式。自动下载加密字体并嵌入 CSS，浏览器打开即可阅读。
+    html     默认。自动下载加密字体并嵌入 CSS，浏览器打开即可阅读。
+    epub     EPUB 3 电子书。自动嵌入字体和封面，可导入阅读器。
     text     纯文本（加密字体无法解码，输出乱码）。
     markdown Markdown 格式（同上限制）。
 
@@ -530,6 +532,181 @@ def html_to_markdown(html: str) -> str:
     return text.strip()
 
 
+# ─── EPUB 打包 ────────────────────────────────────────────────────────────
+
+XHTML_HEAD = """<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>"""
+XHTML_MID = """</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+<h1>"""
+XHTML_TAIL = """</h1>
+"""
+XHTML_END = """</body></html>"""
+
+
+def _make_xhtml(title: str, body: str) -> str:
+    return f"{XHTML_HEAD}{title}{XHTML_MID}{title}{XHTML_TAIL}{body}{XHTML_END}"
+
+
+def _html_body(html: str) -> str:
+    """Extract body content from HTML, stripping <h1> wrapper if present"""
+    # Remove the h1 title that's already included in chapter content
+    body = re.sub(r'<h1[^>]*>.*?</h1>', '', html, flags=re.DOTALL).strip()
+    return body
+
+
+def build_epub(book_dir: Path, info, chapters_dir: Path, font_available: bool, cover_data: Optional[bytes] = None):
+    """将已下载的 HTML 章节打包为 EPUB 3 文件"""
+    import zipfile
+
+    safe_title = sanitize_filename(info.title)
+    epub_path = book_dir / f"{safe_title}.epub"
+
+    oebps = book_dir / "OEBPS"
+    oebps.mkdir(exist_ok=True)
+
+    # 复制字体
+    font_file = book_dir / "font.woff2"
+    if font_available and font_file.exists():
+        import shutil
+        shutil.copy(font_file, oebps / "font.woff2")
+
+    # 封面图片
+    cover_ext = "jpg"
+    cover_in_epub = None
+    if cover_data:
+        cover_path = oebps / f"cover.{cover_ext}"
+        cover_path.write_bytes(cover_data)
+        cover_in_epub = f"cover.{cover_ext}"
+
+    # 写 style.css
+    css = ""
+    if font_available:
+        css += '@font-face{font-family:read;src:url(font.woff2);}\n'
+    css += 'body{font-family:read,sans-serif;line-height:1.8;margin:1em}\n'
+    css += 'h1{font-size:1.4em;text-align:center;margin:1em 0}\n'
+    css += 'p{margin:0.5em 0;text-indent:2em}\n'
+    css += 'img{max-width:100%;height:auto}\n'
+    (oebps / "style.css").write_text(css, encoding="utf-8")
+
+    # 章节 XHTML 文件
+    chapter_files = []
+    for ch in info.chapters:
+        fn = f"{ch.sort_num:04d}_{sanitize_filename(ch.title) or f'第{ch.sort_num}章'}"
+        html_path = chapters_dir / f"{fn}.html"
+        if html_path.exists():
+            raw = html_path.read_text(encoding="utf-8")
+            body = _html_body(raw)
+            xhtml = _make_xhtml(ch.title, body)
+            xhtml_path = oebps / f"ch{ch.sort_num:04d}.xhtml"
+            xhtml_path.write_text(xhtml, encoding="utf-8")
+            chapter_files.append((ch, f"ch{ch.sort_num:04d}.xhtml"))
+
+    # 封面 XHTML
+    if cover_in_epub:
+        cover_xhtml = _make_xhtml("封面",
+            f'<div style="text-align:center"><img src="{cover_in_epub}" alt="封面"/></div>')
+        (oebps / "cover.xhtml").write_text(cover_xhtml, encoding="utf-8")
+
+    if not chapter_files:
+        log.warning("EPUB: 无章节可打包")
+        return
+
+    # --- content.opf ---
+    uid = f"ln-{info.id}-{int(time.time())}"
+    opf_lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id">',
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">',
+        f'  <dc:identifier id="book-id">urn:uuid:{uid}</dc:identifier>',
+        f'  <dc:title>{info.title}</dc:title>',
+        f'  <dc:creator>{info.author}</dc:creator>',
+        f'  <dc:language>zh-CN</dc:language>',
+        f'  <meta property="dcterms:modified">{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}</meta>',
+        '</metadata>',
+        '<manifest>',
+        '  <item id="style" href="style.css" media-type="text/css"/>',
+    ]
+    spine_lines = ['<spine>']
+
+    if cover_in_epub:
+        opf_lines.append(f'  <item id="cover-img" href="{cover_in_epub}" media-type="image/jpeg" properties="cover-image"/>')
+        opf_lines.append('  <item id="cover-page" href="cover.xhtml" media-type="application/xhtml+xml"/>')
+        spine_lines.append('  <itemref idref="cover-page" linear="yes"/>')
+
+    if font_available and (oebps / "font.woff2").exists():
+        opf_lines.append('  <item id="font" href="font.woff2" media-type="font/woff2"/>')
+
+    # 章节条目
+    for ch, fn in chapter_files:
+        cid = f"ch{ch.sort_num:04d}"
+        opf_lines.append(f'  <item id="{cid}" href="{fn}" media-type="application/xhtml+xml"/>')
+        spine_lines.append(f'  <itemref idref="{cid}"/>')
+
+    # nav.xhtml
+    nav_lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<!DOCTYPE html>',
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">',
+        '<head><title>目录</title></head>',
+        '<body><nav epub:type="toc"><h1>目录</h1><ol>',
+    ]
+    for ch, _ in chapter_files:
+        nav_lines.append(f'  <li><a href="ch{ch.sort_num:04d}.xhtml">{ch.title}</a></li>')
+    nav_lines.append('</ol></nav></body></html>')
+    (oebps / "nav.xhtml").write_text("\n".join(nav_lines), encoding="utf-8")
+
+    opf_lines.append('  <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
+
+    opf_lines.append('</manifest>')
+    spine_lines.append('</spine>')
+    opf_lines.extend(spine_lines)
+    opf_lines.append('</package>')
+    (oebps / "content.opf").write_text("\n".join(opf_lines), encoding="utf-8")
+
+    # --- toc.ncx (EPUB 2 兼容) ---
+    ncx_lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">',
+        '<head><meta name="dtb:uid" content="urn:uuid:{uid}"/></head>',
+        f'<docTitle><text>{info.title}</text></docTitle>',
+        '<navMap>',
+    ]
+    for i, (ch, _) in enumerate(chapter_files, 1):
+        ncx_lines.append(f'  <navPoint id="nav{i}" playOrder="{i}">')
+        ncx_lines.append(f'    <navLabel><text>{ch.title}</text></navLabel>')
+        ncx_lines.append(f'    <content src="ch{ch.sort_num:04d}.xhtml"/>')
+        ncx_lines.append(f'  </navPoint>')
+    ncx_lines.append('</navMap></ncx>')
+    (oebps / "toc.ncx").write_text("\n".join(ncx_lines), encoding="utf-8")
+
+    # --- META-INF/container.xml ---
+    meta_dir = book_dir / "META-INF"
+    meta_dir.mkdir(exist_ok=True)
+    (meta_dir / "container.xml").write_text(
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        '</container>'
+    )
+
+    # --- 打包为 ZIP ---
+    epub_path.unlink(missing_ok=True)
+    with zipfile.ZipFile(epub_path, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+    with zipfile.ZipFile(epub_path, "a", zipfile.ZIP_DEFLATED) as zf:
+        for f in meta_dir.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(book_dir))
+        for f in oebps.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(book_dir))
+
+    log.info(f"EPUB 已生成: {epub_path.resolve()}")
+
+
 # ─── 实用工具 ──────────────────────────────────────────────────────────────
 
 
@@ -627,25 +804,28 @@ async def download_book(
             except Exception as e:
                 log.warning(f"封面下载失败: {e}")
 
+        # epub 内部用 html 下载章节，最后打包
+        use_epub = fmt == "epub"
+        internal_fmt = "html" if use_epub else fmt
         total = len(info.chapters)
-        ext = ".html" if fmt == "html" else ".md" if fmt == "markdown" else ".txt"
+        ext = ".html" if internal_fmt == "html" else ".md" if internal_fmt == "markdown" else ".txt"
         failed_chapters = []
 
         # 字体处理：从第一章获取字体 URL 并下载
         font_css = ""
+        font_available = False
         font_warned = False
-        if fmt in ("text", "markdown") and any(True for _ in info.chapters):
-            font_warned = True  # 后面检测到字体再警告
+        if internal_fmt in ("text", "markdown") and any(True for _ in info.chapters):
+            font_warned = True
 
         async def ensure_font(content: ChapterContent) -> str:
             """确保字体文件已下载，返回 CSS @font-face 字符串"""
-            nonlocal font_css, font_warned
+            nonlocal font_css, font_warned, font_available
             if font_css:
                 return font_css
             font_path = content.font_url
             if not font_path:
                 return ""
-            # 下载字体
             font_full_url = f"https://api.lightnovel.life{font_path}" if font_path.startswith("/") else font_path
             font_file = book_dir / "font.woff2"
             if not font_file.exists():
@@ -660,6 +840,7 @@ async def download_book(
                     return ""
             if font_file.exists() and font_file.stat().st_size > 0:
                 font_css = '@font-face{font-family:read;src:url(../font.woff2)}body{font-family:read,sans-serif}\n'
+                font_available = True
             if font_warned and font_css:
                 log.warning("正文使用加密字体，text/markdown 格式无法解码。建议使用 HTML 格式并在浏览器中查看。")
                 font_warned = False
@@ -690,9 +871,9 @@ async def download_book(
                     async with font_lock:
                         chapter_font_css = await ensure_font(content)
 
-                if fmt == "text":
+                if internal_fmt == "text":
                     text = html_to_text(content.content)
-                elif fmt == "markdown":
+                elif internal_fmt == "markdown":
                     text = f"# {content.title}\n\n{html_to_markdown(content.content)}"
                 else:
                     # HTML: 嵌入字体 CSS
@@ -723,9 +904,23 @@ async def download_book(
             sys.stdout.flush()
         sys.stdout.write("\n")
 
+        # EPUB 打包
+        if use_epub:
+            log.info("正在生成 EPUB...")
+            cover_bytes = None
+            if info.cover:
+                try:
+                    async with httpx.AsyncClient(timeout=30) as hc:
+                        resp = await hc.get(info.cover)
+                        if resp.status_code == 200:
+                            cover_bytes = resp.content
+                except Exception:
+                    pass
+            build_epub(book_dir, info, chapters_dir, font_available, cover_bytes)
+
         # 目录
         toc = []
-        if fmt == "markdown":
+        if internal_fmt == "markdown":
             toc.append(f"# {info.title}\n\n作者: {info.author}\n\n")
             if info.introduction:
                 toc.append(f"## 简介\n\n{html_to_text(info.introduction)}\n\n")
@@ -744,7 +939,7 @@ async def download_book(
             f.writelines(toc)
 
         # 合并文件
-        if fmt in ("text", "markdown"):
+        if internal_fmt in ("text", "markdown"):
             combined = book_dir / f"{safe_title}{ext}"
             with open(combined, "w", encoding="utf-8") as f:
                 f.write(f"# {info.title}\n\n" if fmt == "markdown" else f"{'='*40}\n{info.title}\n{'='*40}\n\n")
@@ -862,7 +1057,7 @@ def main():
     add_common_args(dl_parser)
     dl_parser.add_argument("book_id", type=int, help="书籍 ID")
     dl_parser.add_argument("-o", "--output", default="./downloads", help="输出目录")
-    dl_parser.add_argument("-f", "--format", choices=["html", "text", "markdown"], default="html",
+    dl_parser.add_argument("-f", "--format", choices=["html", "text", "markdown", "epub"], default="html",
                            help="输出格式 (默认: html)")
     dl_parser.add_argument("--t2s", action="store_true", help="繁体转简体")
     dl_parser.add_argument("--s2t", action="store_true", help="简体转繁体")
