@@ -551,10 +551,12 @@ def _make_xhtml(title: str, body: str) -> str:
 
 
 def _html_body(html: str) -> str:
-    """Extract body content from HTML, stripping <h1> wrapper if present"""
-    # Remove the h1 title that's already included in chapter content
-    body = re.sub(r'<h1[^>]*>.*?</h1>', '', html, flags=re.DOTALL).strip()
-    return body
+    """Extract body content from HTML, stripping <h1> and <style> tags"""
+    body = re.sub(r'<h1[^>]*>.*?</h1>', '', html, flags=re.DOTALL)
+    body = re.sub(r'<style[^>]*>.*?</style>', '', body, flags=re.DOTALL)
+    # 去除末尾空 <p> 标签
+    body = re.sub(r'(<p[^>]*>\s*</p>\s*)+$', '', body)
+    return body.strip()
 
 
 def build_epub(book_dir: Path, info, chapters_dir: Path, font_available: bool, cover_data: Optional[bytes] = None):
@@ -584,11 +586,13 @@ def build_epub(book_dir: Path, info, chapters_dir: Path, font_available: bool, c
     # 写 style.css
     css = ""
     if font_available:
-        css += '@font-face{font-family:read;src:url(font.woff2);}\n'
-    css += 'body{font-family:read,sans-serif;line-height:1.8;margin:1em}\n'
-    css += 'h1{font-size:1.4em;text-align:center;margin:1em 0}\n'
-    css += 'p{margin:0.5em 0;text-indent:2em}\n'
+        css += ('@font-face{font-family:read;src:url(font.woff2);'
+                'ascent-override:normal;descent-override:normal;line-gap-override:0}\n')
+    css += 'body{font-family:read,sans-serif;line-height:1.5;margin:1em;orphans:1;widows:1}\n'
+    css += 'h1{font-size:1.3em;text-align:center;margin:1em 0;page-break-before:avoid}\n'
+    css += 'p{margin:0.3em 0;text-indent:2em}\n'
     css += 'img{max-width:100%;height:auto}\n'
+    css += 'div,section{margin:0;padding:0}\n'
     (oebps / "style.css").write_text(css, encoding="utf-8")
 
     # 章节 XHTML 文件
