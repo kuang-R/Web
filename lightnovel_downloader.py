@@ -601,9 +601,46 @@ async def download_book(
         ext = ".html" if fmt == "html" else ".md" if fmt == "markdown" else ".txt"
         failed_chapters = []
 
+        # 字体处理：从第一章获取字体 URL 并下载
+        font_css = ""
+        font_warned = False
+        if fmt in ("text", "markdown") and any(True for _ in info.chapters):
+            font_warned = True  # 后面检测到字体再警告
+
+        async def ensure_font(content: ChapterContent) -> str:
+            """确保字体文件已下载，返回 CSS @font-face 字符串"""
+            nonlocal font_css, font_warned
+            if font_css:
+                return font_css
+            font_path = content.font_url
+            if not font_path:
+                return ""
+            # 下载字体
+            font_full_url = f"https://api.lightnovel.life{font_path}" if font_path.startswith("/") else font_path
+            font_file = book_dir / "font.woff2"
+            if not font_file.exists():
+                try:
+                    async with httpx.AsyncClient(timeout=30) as hc:
+                        resp = await hc.get(font_full_url)
+                        if resp.status_code == 200:
+                            font_file.write_bytes(resp.content)
+                            log.info(f"字体已下载 ({len(resp.content)} bytes)")
+                except Exception as e:
+                    log.warning(f"字体下载失败: {e}")
+                    return ""
+            if font_file.exists() and font_file.stat().st_size > 0:
+                font_css = '@font-face{font-family:read;src:url(../font.woff2)}body{font-family:read,sans-serif}\n'
+            if font_warned and font_css:
+                log.warning("正文使用加密字体，text/markdown 格式无法解码。建议使用 HTML 格式并在浏览器中查看。")
+                font_warned = False
+            elif font_warned and not font_css:
+                font_warned = False
+            return font_css
+
         log.info(f"开始下载 {total} 章 (格式: {fmt}, 并发: {max_concurrent})...")
 
         sem = asyncio.Semaphore(max_concurrent)
+        font_lock = asyncio.Lock()
 
         async def download_one(chapter: ChapterInfo) -> bool:
             for attempt in range(1, 4):
@@ -617,12 +654,22 @@ async def download_book(
                     log.warning(f"  ✗ 第{chapter.sort_num}章「{chapter.title}」下载失败: {e}")
                     return False
 
+                # 下载字体（仅第一次）
+                chapter_font_css = ""
+                if content.font_url:
+                    async with font_lock:
+                        chapter_font_css = await ensure_font(content)
+
                 if fmt == "text":
                     text = html_to_text(content.content)
                 elif fmt == "markdown":
                     text = f"# {content.title}\n\n{html_to_markdown(content.content)}"
                 else:
-                    text = content.content
+                    # HTML: 嵌入字体 CSS
+                    if chapter_font_css:
+                        text = f"<style>{chapter_font_css}</style>\n{content.content}"
+                    else:
+                        text = content.content
 
                 safe_ch = sanitize_filename(chapter.title) or f"第{chapter.sort_num}章"
                 filepath = chapters_dir / f"{chapter.sort_num:04d}_{safe_ch}{ext}"
